@@ -1,0 +1,14 @@
+
+venv/
+.venv/
+
+__pycache__/
+*.pyc
+
+data/
+dresses_images/
+jeans_images/
+
+
+.vscode/
+.DS_Store
