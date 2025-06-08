@@ -4,7 +4,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 import streamlit as st
 from PIL import Image
-from image_vector_db import ImageVectorDB
+from db import ImageVectorDB
 import base64
 import io
 import pandas as pd
@@ -112,6 +112,9 @@ st.markdown("""
         background: #1976d2;
         border-radius: 3px;
     }
+    .category-selector {
+        margin-bottom: 20px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -124,24 +127,24 @@ Get inspired and discover your perfect style match!
 
 # --- Robust Pathing ---
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+# Define paths for both categories
 DRESSES_IMAGE_DIR = os.path.join(APP_DIR, "dresses_images")
 DRESSES_METADATA_CSV = os.path.join(APP_DIR, "data", "dresses_with_image_paths.csv")
+JEANS_IMAGE_DIR = os.path.join(APP_DIR, "jeans_images")
+JEANS_METADATA_CSV = os.path.join(APP_DIR, "data", "jeans_with_image_paths.csv")
 
 # --- Database Loading ---
 @st.cache_resource
-def load_database():
-    """Initializes the DB and loads data from predefined sources."""
+def load_database(category):
     db = ImageVectorDB()
-    with st.spinner("🔍 Loading fashion database... This may take a moment."):
-        num_added = db.build_database_from_sources(DRESSES_IMAGE_DIR, DRESSES_METADATA_CSV)
+    with st.spinner(f"🔍 Loading {category} database..."):
+        db.build_database_from_sources(
+            image_folder=DRESSES_IMAGE_DIR if category == "Dresses" else JEANS_IMAGE_DIR,
+            metadata_csv=DRESSES_METADATA_CSV if category == "Dresses" else JEANS_METADATA_CSV,
+            st_ui=st,
+            cache_dir="image_db_cache"  # Custom cache directory
+        )
     return db
-
-# Initialize database
-try:
-    db = load_database()
-except Exception as e:
-    st.error(f"Failed to load database: {str(e)}")
-    st.stop()
 
 # --- Helper functions ---
 def clean_metadata_value(value):
@@ -276,13 +279,30 @@ def create_product_card(result):
 # --- Sidebar ---
 with st.sidebar:
     st.header("🔍 Search Options")
+    
+    # Add category selection
+    category = st.radio(
+        "Choose Category",
+        ["Dresses", "Jeans"],
+        index=0,
+        key="category_select"
+    )
+    
     search_k = st.slider("Number of results", 3, 12, 6, help="How many similar items to show")
     similarity_threshold = st.slider("Minimum similarity", 0.0, 1.0, 0.5, 0.05, 
                                    help="Adjust how similar items must be to your query")
     
     st.markdown("---")
     st.header("ℹ️ Database Info")
-    st.info(f"**Total Fashion Items:** {db.index.ntotal}")
+    
+    # Initialize database based on selected category
+    try:
+        db = load_database(category)
+        st.info(f"**Current Category:** {category}")
+        st.info(f"**Total Items:** {db.index.ntotal}")
+    except Exception as e:
+        st.error(f"Failed to load database: {str(e)}")
+        st.stop()
     
     if st.button("🔄 Refresh Database"):
         st.cache_resource.clear()
@@ -298,13 +318,13 @@ with st.sidebar:
     """)
 
 # --- Main Search Area ---
-st.header("🔎 Upload Your Fashion Inspiration")
+st.header(f"🔎 Upload Your {category} Inspiration")
 
 # File uploader with improved styling
 query_file = st.file_uploader(
     "Drag & drop an image here or click to browse",
     type=["png", "jpg", "jpeg"],
-    help="Upload an image of clothing, accessories, or outfits you like"
+    help=f"Upload an image of {category.lower()} you like"
 )
 
 if query_file:

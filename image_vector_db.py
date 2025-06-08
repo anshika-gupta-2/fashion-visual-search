@@ -10,10 +10,11 @@ import io
 import base64
 import os
 import pandas as pd
+import pickle
 
 class ImageVectorDB:
     """
-    Manages storing and searching for images and their associated metadata.
+    Manages storing and searching for images and their associated metadata with caching support.
     """
     def __init__(self):
         """
@@ -37,6 +38,27 @@ class ImageVectorDB:
         self.id_to_metadata = {}
         self.current_id = 0
 
+    def save(self, filepath):
+        """Save the FAISS index and metadata to disk."""
+        # Save FAISS index
+        faiss.write_index(self.index, f"{filepath}.index")
+        # Save metadata
+        with open(f"{filepath}.metadata", 'wb') as f:
+            pickle.dump({
+                'id_to_metadata': self.id_to_metadata,
+                'current_id': self.current_id
+            }, f)
+
+    def load(self, filepath):
+        """Load the FAISS index and metadata from disk."""
+        # Load FAISS index
+        self.index = faiss.read_index(f"{filepath}.index")
+        # Load metadata
+        with open(f"{filepath}.metadata", 'rb') as f:
+            data = pickle.load(f)
+            self.id_to_metadata = data['id_to_metadata']
+            self.current_id = data['current_id']
+
     def get_image_embedding(self, image_pil):
         """
         Converts a PIL image into a normalized feature vector.
@@ -48,6 +70,14 @@ class ImageVectorDB:
         # Normalize the vector for cosine similarity
         embedding = embedding / np.linalg.norm(embedding)
         return embedding
+
+    def get_image_embeddings_batch(self, image_pils):
+        """Process multiple images simultaneously for better performance."""
+        images_tensor = torch.stack([self.transform(img) for img in image_pils]).to(self.device)
+        with torch.no_grad():
+            embeddings = self.model(images_tensor).squeeze().cpu().numpy()
+        # Normalize all embeddings
+        return embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
 
     def add_image(self, image_pil, metadata):
         """
@@ -65,11 +95,30 @@ class ImageVectorDB:
         self.current_id += 1
         return self.current_id - 1
 
-    def build_database_from_sources(self, image_folder, metadata_csv, st_ui=None):
+    def build_database_from_sources(self, image_folder, metadata_csv, st_ui=None, cache_dir="cache"):
         """
-        Builds the entire database from an image folder and a metadata CSV file.
-        This is a more structured way to ingest data for the project.
+        Builds or loads the database with caching support.
+        Returns the number of items in the database.
         """
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_name = os.path.basename(image_folder.rstrip('/'))
+        cache_path = os.path.join(cache_dir, cache_name)
+        
+        # Try to load from cache
+        if os.path.exists(f"{cache_path}.index") and os.path.exists(f"{cache_path}.metadata"):
+            if st_ui:
+                st_ui.info("Loading pre-built database from cache...")
+            self.load(cache_path)
+            return len(self.id_to_metadata)
+        
+        # Build from scratch if no cache exists
+        added_count = self._build_from_scratch(image_folder, metadata_csv, st_ui)
+        if added_count > 0:
+            self.save(cache_path)  # Save to cache for next time
+        return added_count
+
+    def _build_from_scratch(self, image_folder, metadata_csv, st_ui):
+        """Internal method to build database from source files."""
         if not os.path.exists(metadata_csv):
             if st_ui:
                 st_ui.error(f"Metadata file not found at: {metadata_csv}")
@@ -86,40 +135,30 @@ class ImageVectorDB:
 
         df = pd.read_csv(metadata_csv)
         
-        # DEBUG: Show what columns are actually available
         if st_ui:
             st_ui.info(f"Available columns in CSV: {list(df.columns)}")
             st_ui.info(f"First few rows:\n{df.head()}")
-        else:
-            print(f"Available columns in CSV: {list(df.columns)}")
-            print(f"First few rows:\n{df.head()}")
         
-        # --- ROBUST COLUMN FINDER ---
-        # Search for a valid image column from a list of common names.
+        # Find image column
         image_col = None
         possible_cols = [
             'image', 'filename', 'image_path', 'path', 'file_path', 'image_url',
             'Image', 'Filename', 'ImagePath', 'FilePath', 'img', 'picture',
             'photo', 'image_name', 'file', 'img_path', 'Image Path',
-            'feature_image_path', 'pdp_image_paths'  # Added your specific columns
+            'feature_image_path', 'pdp_image_paths'
         ]
         
-        # Case-insensitive search
         df_cols_lower = [col.lower() for col in df.columns]
         for col in possible_cols:
             if col.lower() in df_cols_lower:
-                # Find the original column name with proper case
                 image_col = df.columns[df_cols_lower.index(col.lower())]
                 break
         
         if image_col:
-            # Create a standardized 'image_filename' column
-            # Handle both full paths and just filenames
             df['image_filename'] = df[image_col].apply(lambda x: str(x) if pd.notna(x) else '')
             if st_ui:
                 st_ui.success(f"Found image column: '{image_col}'")
         else:
-            # If no valid column is found, display an informative error.
             available_cols = ", ".join(df.columns.tolist())
             error_message = f"Could not find an image filename column in the CSV.\nSearched for: {', '.join(possible_cols)}\nAvailable columns: {available_cols}"
             if st_ui:
@@ -127,21 +166,23 @@ class ImageVectorDB:
             else:
                 print(error_message)
             return 0
-        # --- END ROBUST COLUMN FINDER ---
 
+        # Batch processing
+        batch_size = 32
+        image_batch = []
+        metadata_batch = []
         added_count = 0
+        
         for _, row in df.iterrows():
-            # Try the full path first, then try relative to image_folder
             image_filename = row['image_filename']
-            if not image_filename:  # Skip empty paths
+            if not image_filename:
                 continue
                 
-            # Try multiple path combinations
             possible_paths = [
-                os.path.join(image_folder, image_filename),  # Original logic
-                os.path.join(os.path.dirname(image_folder), image_filename),  # One level up
-                image_filename,  # Absolute path
-                os.path.join(image_folder, os.path.basename(image_filename))  # Just filename
+                os.path.join(image_folder, image_filename),
+                os.path.join(os.path.dirname(image_folder), image_filename),
+                image_filename,
+                os.path.join(image_folder, os.path.basename(image_filename))
             ]
             
             image_path = None
@@ -153,20 +194,41 @@ class ImageVectorDB:
             if image_path and os.path.exists(image_path):
                 try:
                     image = Image.open(image_path).convert("RGB")
-                    # Convert row to a dictionary for metadata
-                    metadata = row.to_dict()
-                    self.add_image(image, metadata)
-                    added_count += 1
+                    image_batch.append(image)
+                    metadata_batch.append(row.to_dict())
+                    
+                    if len(image_batch) >= batch_size:
+                        embeddings = self.get_image_embeddings_batch(image_batch)
+                        self.index.add(embeddings.astype('float32'))
+                        
+                        for i, (img, meta) in enumerate(zip(image_batch, metadata_batch)):
+                            buffered = io.BytesIO()
+                            img.save(buffered, format="JPEG")
+                            meta['image_data'] = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                            self.id_to_metadata[self.current_id + i] = meta
+                        
+                        self.current_id += len(image_batch)
+                        added_count += len(image_batch)
+                        image_batch = []
+                        metadata_batch = []
+                        
                 except Exception as e:
                     if st_ui:
                         st_ui.warning(f"Skipping {image_filename}: {e}")
-                    else:
-                        print(f"Error processing {image_path}: {e}")
-            else:
-                if st_ui:
-                    st_ui.warning(f"Image not found: {image_filename}")
-                else:
-                    print(f"Image not found: {image_filename}")
+        
+        # Process remaining images in the last batch
+        if image_batch:
+            embeddings = self.get_image_embeddings_batch(image_batch)
+            self.index.add(embeddings.astype('float32'))
+            
+            for i, (img, meta) in enumerate(zip(image_batch, metadata_batch)):
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG")
+                meta['image_data'] = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                self.id_to_metadata[self.current_id + i] = meta
+            
+            added_count += len(image_batch)
+            self.current_id += len(image_batch)
         
         if added_count == 0 and st_ui:
             st_ui.warning("Found data files, but could not add any images. Check image filenames in the CSV match files in the image folder.")
@@ -200,7 +262,7 @@ class ImageVectorDB:
                 metadata = self.id_to_metadata.get(idx, {}).copy()
                 results.append({
                     'id': idx,
-                    'similarity': float(similarity),  # Convert numpy float to Python float
+                    'similarity': float(similarity),
                     'metadata': metadata
                 })
         
